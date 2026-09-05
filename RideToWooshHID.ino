@@ -37,6 +37,8 @@
 #include <Preferences.h>
 #include <nvs_flash.h>
 #include <esp_partition.h>
+#include <esp_system.h>
+#include <atomic>
 #include "webui.h"
 #include "i18n.h"     // Sprachdateien (EN/DE) als PROGMEM-JSON
 
@@ -109,22 +111,53 @@ static const size_t N_BTN = sizeof(BUTTONS)/sizeof(BUTTONS[0]);
 // --------------------------------------------------------------------
 //  Globale Objekte / Zustand
 // --------------------------------------------------------------------
-BleKeyboard       bleKeyboard(HID_NAME, "DIY", 100);
+class LoggedBleKeyboard : public BleKeyboard {
+public:
+  using BleKeyboard::BleKeyboard;
+protected:
+  void onStarted(NimBLEServer* server) override {
+    BleKeyboard::onStarted(server);
+    server->setCallbacks(this, false); // The keyboard has static lifetime.
+  }
+  void onConnect(NimBLEServer* server, NimBLEConnInfo& info) override {
+    BleKeyboard::onConnect(server, info);
+    Serial.printf("[%lu][PC] connected handle=%u interval=%.2fms latency=%u timeout=%ums\n",
+      millis(), info.getConnHandle(), info.getConnInterval()*1.25,
+      info.getConnLatency(), info.getConnTimeout()*10U);
+  }
+  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& info, int reason) override {
+    BleKeyboard::onDisconnect(server, info, reason);
+    Serial.printf("[%lu][PC] disconnected handle=%u reason=%d (0x%X) heap=%u\n",
+      millis(), info.getConnHandle(), reason, (unsigned)reason, ESP.getFreeHeap());
+  }
+  void onAuthenticationComplete(NimBLEConnInfo& info) override {
+    BleKeyboard::onAuthenticationComplete(info);
+    Serial.printf("[%lu][PC] security encrypted=%d bonded=%d authenticated=%d\n",
+      millis(), info.isEncrypted(), info.isBonded(), info.isAuthenticated());
+  }
+};
+LoggedBleKeyboard bleKeyboard(HID_NAME, "DIY", 100);
 AsyncWebServer    httpServer(80);       // Weboberfläche + WebSocket (ein Server)
 AsyncWebSocket    wsLive("/ws");        // WebSocket-Live-Daten unter /ws (Port 80)
 Preferences       prefs;
 
 String keyMap[32];                     // Index = Bitposition -> Key-Token
-volatile uint32_t lastPressedMask = 0; // intern: 1 == gedrückt
+uint32_t          lastPressedMask = 0; // Guarded by rideMux.
 uint32_t          prevPressedMask = 0;
 
 NimBLEClient*           rideClient   = nullptr;
 NimBLERemoteCharacteristic* rideMeasure = nullptr; // notify (0x23 kommt hier)
 NimBLERemoteCharacteristic* rideControl = nullptr; // write (RideOn)
-volatile bool     rideConnected = false;
-volatile bool     wantReconnect = false;
-volatile bool     stateDirty    = false;   // Statuswechsel aus BLE-Task -> Broadcast in loop()
-NimBLEAdvertisedDevice* foundRide = nullptr;
+std::atomic<bool> rideConnected{false};
+std::atomic<bool> rideDisconnected{false};
+std::atomic<bool> scanFinished{true};
+std::atomic<NimBLEAdvertisedDevice*> foundRide{nullptr};
+portMUX_TYPE rideMux = portMUX_INITIALIZER_UNLOCKED;
+uint32_t nextRideScan = 0;
+bool rideCleanupPending = false;
+uint32_t nextRideDisconnect = 0;
+static const uint32_t RIDE_SCAN_MS = 3000;
+static const uint32_t RIDE_RETRY_MS = 2000;
 String            rideDevName  = "";        // Name+MAC der verbundenen Ride (fürs UI)
 SemaphoreHandle_t mapMutex     = nullptr;    // schützt keyMap[] gegen Task-Races
 const char*       cfgPartInUse = nullptr;    // "cfg" wenn vorhanden, sonst NULL(=Default-NVS)
@@ -339,20 +372,24 @@ void onRideNotify(NimBLERemoteCharacteristic* c, uint8_t* data, size_t len, bool
   if(an[0] >=  STEER_THRESH) pressed |= 0x2000000;   // Hebel links  ►
   if(an[1] <= -STEER_THRESH) pressed |= 0x4000000;   // Hebel rechts ◄
   if(an[1] >=  STEER_THRESH) pressed |= 0x8000000;   // Hebel rechts ►
-  lastPressedMask = pressed;
+  portENTER_CRITICAL(&rideMux);
+  if(!rideDisconnected.load()) lastPressedMask = pressed;
+  portEXIT_CRITICAL(&rideMux);
 }
 
 // --------------------------------------------------------------------
 //  Verarbeitung der Tastendrücke (Flankenerkennung) im loop()
 // --------------------------------------------------------------------
 void handlePresses(){
-  uint32_t now  = lastPressedMask;
+  portENTER_CRITICAL(&rideMux);
+  uint32_t now = rideConnected.load() ? lastPressedMask : 0;
+  portEXIT_CRITICAL(&rideMux);
   uint32_t rising = now & ~prevPressedMask;   // neu gedrückt
   if(rising){
     for(size_t k=0;k<N_BTN;k++){
       if(rising & BUTTONS[k].mask){
         int bit=maskToIndex(BUTTONS[k].mask);
-        if(bit>=0 && bleKeyboard.isConnected()){
+        if(bit>=0 && rideConnected.load() && bleKeyboard.isConnected()){
           // keyMap kann vom WebServer-Task (setKeyFor) verändert werden ->
           // unter Mutex in eine lokale Kopie ziehen, dann erst senden.
           String tok;
@@ -517,32 +554,39 @@ void onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
 //  BLE Central: Scan + Verbindung zur Ride
 // --------------------------------------------------------------------
 class ScanCB : public NimBLEScanCallbacks {
+  NimBLEAdvertisedDevice* candidate = nullptr;
   void onResult(const NimBLEAdvertisedDevice* dev) override {
     String name = dev->getName().c_str();
     // Ride heißt im BLE "Zwift SF2" (NICHT "Zwift Ride") -> breit auf "Zwift" matchen.
-    if(name.indexOf("Zwift")>=0){
+    if(!candidate && name.indexOf("Zwift")>=0){
       Serial.printf("[BLE] Ride gefunden: '%s' (%s)\n",
                     name.c_str(), dev->getAddress().toString().c_str());
-      if(foundRide){ delete foundRide; }
-      foundRide = new NimBLEAdvertisedDevice(*dev);
-      NimBLEDevice::getScan()->stop();
-      wantReconnect = true;
+      candidate = new NimBLEAdvertisedDevice(*dev);
     }
+  }
+  void onScanEnd(const NimBLEScanResults&, int reason) override {
+    // Publish only after the finite scan ends; never stop inside onResult.
+    delete foundRide.exchange(candidate); // Host resync can also call onScanEnd.
+    candidate = nullptr;
+    Serial.printf("[%lu][Ride] scan ended reason=%d\n", millis(), reason);
+    scanFinished.store(true);
   }
 };
 
 class ClientCB : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient* c) override { Serial.println("[BLE] verbunden."); }
   void onDisconnect(NimBLEClient* c, int reason) override {
-    Serial.printf("[BLE] getrennt (reason %d). Scanne neu...\n", reason);
-    rideConnected=false; rideMeasure=nullptr; rideControl=nullptr;
-    if(mapMutex) xSemaphoreTake(mapMutex, portMAX_DELAY);
-    rideDevName="";
-    if(mapMutex) xSemaphoreGive(mapMutex);
-    stateDirty=true;   // WS-Broadcast aus loop() anstoßen (nicht aus dem BLE-Task)
-    NimBLEDevice::getScan()->start(0, false, true);
+    portENTER_CRITICAL(&rideMux);
+    rideConnected.store(false);
+    rideDisconnected.store(true);
+    lastPressedMask = 0;
+    portEXIT_CRITICAL(&rideMux);
+    Serial.printf("[%lu][Ride] disconnected reason=%d (0x%X) heap=%u\n",
+      millis(), reason, (unsigned)reason, ESP.getFreeHeap());
   }
 };
+static ClientCB rideCallbacks;
+static ScanCB scanCallbacks;
 
 // Sucht in allen Services nach: einer notify- und einer write-Characteristic.
 // Die Zwift-Ride nutzt eine herstellereigene Service-UUID; wir greifen die
@@ -575,33 +619,51 @@ bool findZwiftChars(NimBLEClient* c){
   return rideMeasure && rideControl;
 }
 
-bool connectRide(){
-  // Ownership atomar übernehmen: der ScanCB (BLE-Task) könnte foundRide sonst
-  // mitten im Connect überschreiben/löschen -> lokal rausziehen und nullen.
-  NimBLEAdvertisedDevice* dev = foundRide;
-  foundRide = nullptr;
-  if(!dev) return false;
+bool connectRide(NimBLEAdvertisedDevice* dev){
   Serial.println("[BLE] verbinde zur Ride...");
-  if(rideClient){ NimBLEDevice::deleteClient(rideClient); rideClient=nullptr; }
-  rideClient = NimBLEDevice::createClient();
-  rideClient->setClientCallbacks(new ClientCB(), false);
+  if(!rideClient){
+    rideClient = NimBLEDevice::createClient();
+    if(!rideClient){
+      Serial.println("[Ride] client allocation failed");
+      return false;
+    }
+    rideClient->setClientCallbacks(&rideCallbacks, false);
+    rideClient->setSelfDelete(false, false);
+    rideClient->setConnectTimeout(5000);
+  }
+  rideDisconnected.store(false);
+  portENTER_CRITICAL(&rideMux);
+  lastPressedMask = 0;
+  portEXIT_CRITICAL(&rideMux);
+  prevPressedMask = 0;
   if(!rideClient->connect(dev)){
-    Serial.println("[BLE] connect() fehlgeschlagen.");
-    delete dev;
+    Serial.printf("[Ride] connect failed error=%d\n", rideClient->getLastError());
     return false;
   }
   rideMeasure=nullptr; rideControl=nullptr;  // alte Pointer eines früheren Clients verwerfen
   if(!findZwiftChars(rideClient)){
     Serial.println("[BLE] keine passenden Characteristics gefunden.");
-    rideClient->disconnect();
-    delete dev;
     return false;
   }
   // RideOn-Handshake: "RideOn" schreiben — mit Response nur, wenn unterstützt.
-  rideControl->writeValue((const uint8_t*)RIDEON_MAGIC, 6, rideControl->canWrite());
+  if(rideDisconnected.load() || !rideClient->isConnected()) return false;
+  if(!rideControl->writeValue((const uint8_t*)RIDEON_MAGIC, 6, rideControl->canWrite())){
+    Serial.printf("[Ride] handshake failed error=%d\n", rideClient->getLastError());
+    return false;
+  }
   delay(40);
   // Abonnieren: Notify (true) bzw. Indicate (false), je nach Characteristic
-  rideMeasure->subscribe(rideMeasure->canNotify(), onRideNotify);
+  if(rideDisconnected.load() || !rideClient->isConnected()) return false;
+  // NimBLE subscribe() can report success when CCCD discovery returns null.
+  if(!rideMeasure->getDescriptor(NimBLEUUID((uint16_t)0x2902))){
+    Serial.printf("[Ride] notification descriptor missing/discovery failed error=%d\n",
+      rideClient->getLastError());
+    return false;
+  }
+  if(!rideMeasure->subscribe(rideMeasure->canNotify(), onRideNotify)){
+    Serial.printf("[Ride] subscription failed error=%d\n", rideClient->getLastError());
+    return false;
+  }
   // Gerätenamen + Adresse für die UI-Anzeige merken (String -> unter Mutex)
   String nm = dev->getName().c_str();
   if(nm.isEmpty()) nm = "Zwift Ride";
@@ -609,8 +671,12 @@ bool connectRide(){
   if(mapMutex) xSemaphoreTake(mapMutex, portMAX_DELAY);
   rideDevName = nm;
   if(mapMutex) xSemaphoreGive(mapMutex);
-  delete dev;                              // nicht mehr gebraucht — kein Leak/UAF
-  rideConnected = true;
+  // Serialize readiness with disconnect, without holding a lock over BLE calls.
+  portENTER_CRITICAL(&rideMux);
+  bool ready = !rideDisconnected.load();
+  rideConnected.store(ready);
+  portEXIT_CRITICAL(&rideMux);
+  if(!ready) return false;
   broadcastState();                         // connectRide läuft im loop()-Kontext
   Serial.println("[BLE] Ride aktiv — Buttons werden gelesen.");
   return true;
@@ -623,6 +689,8 @@ void setup(){
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=== RideToWooshHID " FW_VERSION " startet ===");
+  Serial.printf("[Boot] reset_reason=%d heap=%u min_heap=%u\n",
+    (int)esp_reset_reason(), ESP.getFreeHeap(), ESP.getMinFreeHeap());
 
   mapMutex = xSemaphoreCreateMutex();   // schützt keyMap[] (Loop vs. WebServer-Task)
   initConfigStore();                    // getrennte 'cfg'-NVS-Partition vorbereiten
@@ -634,14 +702,12 @@ void setup(){
 
   // 2) BLE-Central für die Ride. NimBLE teilt sich den Controller.
   NimBLEScan* scan = NimBLEDevice::getScan();
-  scan->setScanCallbacks(new ScanCB(), false);
+  scan->setScanCallbacks(&scanCallbacks, false);
+  scan->setMaxResults(0); // Callback-only results; no indefinite advertiser cache.
   scan->setActiveScan(true);
-  // Koexistenz mit WiFi-AP: NICHT dauerscannen (Einheiten 0.625 ms).
-  // 160/48 = 100 ms Intervall, 30 ms Fenster -> ~30% Funk-Duty, damit der
-  // WiFi-AP Association/DHCP beantworten kann (sonst Verbindungs-Timeout).
+  // NimBLE 2.x uses milliseconds: 160 ms interval / 48 ms window (~30%).
   scan->setInterval(160);
   scan->setWindow(48);
-  scan->start(0, false, true);
   Serial.println("[BLE] Scanne nach 'Zwift Ride'...");
 
   // 3) WiFi Accesspoint + Webserver
@@ -687,14 +753,52 @@ void setup(){
 // --------------------------------------------------------------------
 uint32_t lastState=0;
 void loop(){
-  if(wantReconnect){
-    wantReconnect=false;
-    // Scheitert der Connect, Scan wieder anwerfen (sonst hängt der Reconnect).
-    if(!connectRide()) NimBLEDevice::getScan()->start(0, false, true);
+  if(rideDisconnected.exchange(false)){
+    rideCleanupPending = false;
+    rideMeasure = nullptr;
+    rideControl = nullptr;
+    prevPressedMask = 0;
+    if(mapMutex) xSemaphoreTake(mapMutex, portMAX_DELAY);
+    rideDevName = "";
+    if(mapMutex) xSemaphoreGive(mapMutex);
+    broadcastButtons(0);
+    broadcastState();
+    nextRideScan = millis() + RIDE_RETRY_MS;
   }
-  if(stateDirty){              // vom BLE-Task angestoßen (z.B. Disconnect)
-    stateDirty=false;
-    broadcastState();          // WS-Send nur aus loop()-Kontext
+  if(rideCleanupPending){
+    // isConnected() is already false while DISCONNECTING. Wait for the event.
+    if(rideClient->isConnected() && (int32_t)(millis() - nextRideDisconnect) >= 0){
+      if(!rideClient->disconnect()){
+        Serial.printf("[%lu][Ride] disconnect request failed error=%d; retrying\n",
+          millis(), rideClient->getLastError());
+      }
+      nextRideDisconnect = millis() + RIDE_RETRY_MS;
+    }
+  }
+  if(!rideCleanupPending && scanFinished.load() && !rideConnected.load() &&
+     (!rideClient || !rideClient->isConnected()) &&
+     (int32_t)(millis() - nextRideScan) >= 0){
+    NimBLEAdvertisedDevice* dev = foundRide.exchange(nullptr);
+    if(dev){
+      if(!connectRide(dev)){
+        rideConnected.store(false);
+        rideCleanupPending = rideClient && rideClient->isConnected();
+        nextRideDisconnect = millis();
+        if(mapMutex) xSemaphoreTake(mapMutex, portMAX_DELAY);
+        rideDevName = "";
+        if(mapMutex) xSemaphoreGive(mapMutex);
+        broadcastState();
+      }
+      delete dev;
+      nextRideScan = millis() + RIDE_RETRY_MS;
+    }else{
+      scanFinished.store(false);
+      if(!NimBLEDevice::getScan()->start(RIDE_SCAN_MS, false, false)){
+        Serial.printf("[%lu][Ride] scan start failed; retrying\n", millis());
+        scanFinished.store(true);
+      }
+      nextRideScan = millis() + RIDE_RETRY_MS;
+    }
   }
   handlePresses();
 
@@ -708,5 +812,12 @@ void loop(){
     }
   }
   wsLive.cleanupClients();
+  static uint32_t lastHealth = 0;
+  if(millis() - lastHealth >= 60000){
+    lastHealth = millis();
+    Serial.printf("[%lu][Health] heap=%u min_heap=%u pc=%d ride=%d\n",
+      millis(), ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+      bleKeyboard.isConnected(), rideConnected.load());
+  }
   delay(5);
 }

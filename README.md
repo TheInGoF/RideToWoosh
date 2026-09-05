@@ -216,6 +216,34 @@ Button mapping is based on the public reverse-engineering work of **MAKINOLO**
 
 ## Troubleshooting
 
+### Intermittent Bluetooth Disconnects
+
+The serial monitor (`pio device monitor -b 115200`) now distinguishes the two
+Bluetooth links and whole-device resets:
+
+- `[PC] disconnected` includes the HID connection's numeric disconnect reason
+  in decimal and hex. PC connection parameters and security state are also logged.
+- `[Ride] disconnected` refers to the controller, not the PC.
+- `[Boot] reset_reason=...` indicates a boot and reports the ESP-IDF reset reason.
+  A new boot message during a dropout suggests a device reset rather than only
+  a lost Bluetooth link.
+- `[Health]` reports uptime, current/minimum free heap, and both link states once
+  per minute. Capture these lines before and after a failure.
+
+Ride discovery uses finite three-second scans with callback-only results. Failed
+scan starts and connection setup are retried with a two-second backoff; connection
+attempts use a five-second stack timeout (not a deadline for all GATT setup).
+The bridge only marks the Ride ready after handshake and subscription succeed.
+PC advertising/reconnection remains managed by the keyboard library and PC.
+
+After flashing, check PC Bluetooth off/on and sleep/wake, switch the Ride off
+during setup and while holding a button, and repeat reconnects while using the web
+interface. Verify that buttons work again, stale highlights clear, and free heap
+does not continually decline. A firmware build alone cannot validate RF stability
+or Windows power-management behavior. Include the serial log with any remaining
+disconnect report. PlatformIO dependencies are pinned in `platformio.ini` so
+repeated builds use the same library versions.
+
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Can't see the `RideToWooshHID` Wi-Fi | TX power is intentionally low | Stand next to the bike; or raise `AP_TX_POWER` |
