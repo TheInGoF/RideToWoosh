@@ -13,7 +13,7 @@
 // an die Firmware (setmap), persistent erst per "Speichern" -> "Unsaved"-Anzeige.
 //
 // WS-Protokoll (JSON):
-//   ESP -> Browser: {"t":"state","ride":bool,"hid":bool,"ip":"...","rideDev":"..","hidDev":".."}
+//   ESP -> Browser: {"t":"state","ride":bool,"hid":bool,"ip":"...","rideDev":"..","hidDev":"..","bat":0-100|-1}
 //                   {"t":"btn","mask":<uint32>,"names":[...]}
 //                   {"t":"map","map":{"LEFT_BTN":"a", ...}}
 //   Browser -> ESP: {"t":"setmap","btn":"..","key":".."}  {"t":"getmap"}  {"t":"save"}
@@ -310,6 +310,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLDELIM(
     <div class="presets">
       <span class="pl" data-i18n="presets.label">Quick presets</span>
       <button class="chip" data-preset="MyWhoosh">MyWhoosh</button>
+      <button class="chip" data-preset="MyWhooshClickV2">MyWhoosh · Click V2</button>
       <button class="chip" data-preset="Zwift">Zwift</button>
     </div>
     <div id="groups"></div>
@@ -454,6 +455,17 @@ const TILES = [["mapping",ICONS.mapping],["history",ICONS.history],["devices",IC
 const PRESETS = {
   MyWhoosh: {SHFT_UP_L_BTN:"i",SHFT_DN_L_BTN:"k",SHFT_UP_R_BTN:"i",SHFT_DN_R_BTN:"k",
     LEFT_BTN:"LEFT",RIGHT_BTN:"RIGHT",UP_BTN:"UP",DOWN_BTN:"DOWN"},
+  // Click V2: je Seite nur EIN Paddle, beide melden "UP" (links=Bit 8, rechts=Bit 12).
+  // SRAM-Logik: links leichter, rechts schwerer.
+  // Shift-Tasten getestet (MyWhoosh): "i" macht es LEICHTER, "k" SCHWERER - die
+  // MyWhoosh-Doku nennt I = Shift Up, das stimmt hier nicht. Daher links=i (leichter),
+  // rechts=k (schwerer, "+" wie bei SRAM).
+  // Links: Pfeiltasten (Lenken/Navigation). Rechts: nur Tasten, die MyWhoosh
+  // wirklich kennt (Emotes 1-7, U = minimale UI): Y=Minimal UI, Z=Wave,
+  // A=Thumbs up, B=Fist bump.
+  MyWhooshClickV2: {SHFT_UP_L_BTN:"i",SHFT_UP_R_BTN:"k",
+    LEFT_BTN:"LEFT",RIGHT_BTN:"RIGHT",UP_BTN:"UP",DOWN_BTN:"DOWN",
+    Y_BTN:"u",Z_BTN:"2",A_BTN:"7",B_BTN:"3"},
   Zwift: {SHFT_UP_L_BTN:"UP",SHFT_DN_L_BTN:"DOWN",SHFT_UP_R_BTN:"UP",SHFT_DN_R_BTN:"DOWN",
     LEFT_BTN:"LEFT",RIGHT_BTN:"RIGHT",UP_BTN:"UP",DOWN_BTN:"DOWN",A_BTN:"SPACE"}
 };
@@ -465,7 +477,7 @@ const MIRROR = {SHFT_UP_L_BTN:"SU",SHFT_UP_R_BTN:"SU",SHFT_DN_L_BTN:"SD",SHFT_DN
 const $ = id => document.getElementById(id);
 let ws, mapping = {}, T = {}, dirty = false, pickerTarget = null;
 let LANG = localStorage.getItem("lang") || "en";
-let lastState = {ride:false,hid:false,rideDev:"",hidDev:""};
+let lastState = {ride:false,hid:false,rideDev:"",hidDev:"",bat:-1};
 let liveSet = new Set(), lastNames = [];
 
 const escHtml = s => String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -630,7 +642,7 @@ function renderState(){
   $("pIn").setAttribute("aria-label",(tp("conn.in")||"")+": "+(s.ride?conn:disc));
   $("pOut").setAttribute("aria-label",(tp("conn.out")||"")+": "+(s.hid?conn:disc));
   const iv=$("dvInVal"), ov=$("dvOutVal");
-  iv.textContent=s.ride?(s.rideDev||tp("conn.inFb")||""):disc; iv.classList.toggle("on",s.ride);
+  iv.textContent=s.ride?((s.rideDev||tp("conn.inFb")||"")+(s.bat>=0?" · "+s.bat+" %":"")):disc; iv.classList.toggle("on",s.ride);
   ov.textContent=s.hid?(s.hidDev||tp("conn.outFb")||""):disc; ov.classList.toggle("on",s.hid);
   // setup checklist (home) — show until both connected
   $("step-kbd").classList.toggle("done",s.hid);
@@ -653,10 +665,10 @@ function connect(){
   ws=new WebSocket("ws://"+location.hostname+"/ws");
   ws.onopen=()=>{ $("banner").classList.remove("show"); send({t:"getmap"}); };
   ws.onmessage=e=>{ let m; try{ m=JSON.parse(e.data); }catch(_){ return; }
-    if(m.t==="state"){ lastState={ride:!!m.ride,hid:!!m.hid,rideDev:m.rideDev||"",hidDev:m.hidDev||""}; renderState(); }
+    if(m.t==="state"){ lastState={ride:!!m.ride,hid:!!m.hid,rideDev:m.rideDev||"",hidDev:m.hidDev||"",bat:(typeof m.bat==="number"?m.bat:-1)}; renderState(); }
     else if(m.t==="btn"){ flashButtons(m.names||[]); }
     else if(m.t==="map"){ applyMap(m.map||{}); setDirty(false); } };
-  ws.onclose=()=>{ lastState={ride:false,hid:false,rideDev:"",hidDev:""}; renderState();
+  ws.onclose=()=>{ lastState={ride:false,hid:false,rideDev:"",hidDev:"",bat:-1}; renderState();
     $("banner").classList.add("show"); setTimeout(connect,1200); };
 }
 
